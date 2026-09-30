@@ -50,7 +50,11 @@ def build_parser(
     p_eval = sub.add_parser(
         "evaluate", help="evaluate predictions with the benchmark's harness (step 5)"
     )
-    p_eval.add_argument("--predictions", required=True, help="predictions JSONL path")
+    p_eval.add_argument(
+        "--predictions",
+        default=None,
+        help="predictions JSONL path (default: newest runs/<timestamp>/predictions.jsonl)",
+    )
     p_eval.add_argument(
         "--dataset", required=True, help="dataset the predictions are from"
     )
@@ -64,7 +68,11 @@ def build_parser(
 
     p_rep = sub.add_parser("report", help="summarize a harness report")
     p_rep.add_argument("--dataset", required=True, help="benchmark the run belongs to")
-    p_rep.add_argument("--run-id", required=True, help="harness run id to summarize")
+    p_rep.add_argument(
+        "--run-id",
+        default=None,
+        help="harness run id to summarize (default: newest report in logs/)",
+    )
     p_rep.set_defaults(func=funcs["report"])
 
     return parser

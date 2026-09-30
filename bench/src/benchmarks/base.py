@@ -112,11 +112,12 @@ class Benchmark(ABC):
         log(f"Benchmark '{self.name}' does not implement evaluation.")
         return 1
 
-    def summarize_report(self, run_id: str) -> int:
+    def summarize_report(self, run_id: str | None) -> int:
         """Print a summary of the harness report for ``run_id``.
 
-        Optional: a benchmark that does not implement this cannot be used
-        with the ``report`` subcommand.
+        ``run_id=None`` asks for the newest available report. Optional: a
+        benchmark that does not implement this cannot be used with the
+        ``report`` subcommand.
         """
         log(f"Benchmark '{self.name}' does not implement report summaries.")
         return 1

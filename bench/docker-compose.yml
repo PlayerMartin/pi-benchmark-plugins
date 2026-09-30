@@ -1,32 +1,37 @@
 # docker compose for the bench pipeline.
 #
-#   cp .env.example .env      # then edit .env (AGENT_MODEL + credentials)
+#   cp .env.example .env      # then edit .env (DATASET, AGENT_MODEL, MODEL_NAME + a key)
 #
-#   docker compose run --rm runner list --limit 10        # inspect instances
-#   docker compose up runner                              # run steps 1-4 (uses .env)
-#   docker compose run --rm runner run --limit 5         # explicit CLI args
-#   docker compose --profile eval run --rm evaluate       # step 5 (needs Docker daemon)
-#   docker compose --profile eval run --rm evaluate report
+#   docker compose up run      # steps 1-4: dataset -> workspace -> agent -> predictions
+#   docker compose up eval     # step 5: evaluate the newest predictions (needs Docker)
+#   docker compose up report   # summarize the newest report
 #
-# `docker compose run` forwards any trailing args verbatim to the Python CLI,
-# bypassing the environment-variable defaults.
+# `eval` and `report` sit behind the "eval" profile: naming the service on the
+# command line activates its profile automatically, so the three commands above
+# just work, while a bare `docker compose up` still only runs `run`.
+#
+# Full CLI passthrough for anything else:
+#   docker compose run --rm run list --limit 10
+#   docker compose run --rm run --skip 10 --limit 5
 name: bench
 
-x-pipeline-env: &pipeline-env
-  PIPELINE_CMD: ${PIPELINE_CMD:-run}
+x-common-env: &common-env
+  # From .env (the only knobs that live there):
   DATASET: ${DATASET:-}
-  INSTANCES: ${INSTANCES:-}
-  LIMIT: ${LIMIT:-0}
-  AGENT: ${AGENT:-pi}
   AGENT_MODEL: ${AGENT_MODEL:-}
   MODEL_NAME: ${MODEL_NAME:-}
+  LIMIT: ${LIMIT:-0}
+  # Optional overrides, ad hoc: `AGENT_TIMEOUT=300 docker compose up run`
+  SKIP: ${SKIP:-0}
+  AGENT: ${AGENT:-pi}
   AGENT_TIMEOUT: ${AGENT_TIMEOUT:-1800}
   AGENT_EXTRA_ARGS: ${AGENT_EXTRA_ARGS:-}
+  EVAL_WORKERS: ${EVAL_WORKERS:-4}
   HF_HOME: /root/.cache/huggingface
 
 services:
   # ---- Steps 1-4: dataset -> workspace -> agent -> predictions.jsonl ---------
-  runner:
+  run:
     build:
       context: .
       target: base
@@ -34,30 +39,28 @@ services:
         PI_VERSION: ${PI_VERSION:-latest}
     image: bench:latest
     init: true
+    environment:
+      <<: *common-env
+      PIPELINE_CMD: run
     env_file:
-      # Optional: carries HF_TOKEN and provider API keys. Missing file is fine.
+      # Optional: carries credentials (e.g. provider API keys). Missing file is fine.
       - path: .env
         required: false
-    environment:
-      <<: *pipeline-env
     volumes:
       # Pipeline output persists on the host (predictions.jsonl, manifest, logs).
       - ./runs:/app/runs
-      # Live pipeline sources (override the baked copies, so edits need no rebuild).
+      # Pi home dir (~/.pi). Pi resolves its config at ~/.pi/agent, so mount the
+      # home (not the agent subdir) and models.json / auth.json land correctly.
+      - ${PI_HOME:-./.pi-home}:/root/.pi
+      # Live pipeline sources (see x-src-mounts) + the HF dataset cache.
       - ./src/run_bench.py:/app/run_bench.py:ro
       - ./src/pi_logging.py:/app/pi_logging.py:ro
       - ./src/benchmarks:/app/benchmarks:ro
-      # Pi home dir (~/.pi). Pi resolves its config at ~/.pi/agent, so mount the
-      # home (not the agent subdir) and models.json / auth.json land correctly.
-      # PI_AGENT_DIR is kept as a legacy alias.
-      - ${PI_HOME:-${PI_AGENT_DIR:-./.pi-home}}:/root/.pi
-      # Dataset cache so we do not re-download datasets on every run.
       - hf-cache:/root/.cache/huggingface
 
-  # ---- Step 5: evaluation harness of the bundled SWE-bench benchmark ---------
-  # (Linux + Docker required). Gated behind the "eval" profile so it never
-  # starts with `docker compose up`.
-  evaluate:
+  # ---- Step 5: evaluation via the benchmark's harness -----------------------
+  # (needs a reachable Docker daemon; auto-detects the newest predictions.jsonl)
+  eval:
     profiles: ["eval"]
     build:
       context: .
@@ -66,29 +69,45 @@ services:
         PI_VERSION: ${PI_VERSION:-latest}
     image: bench:eval
     init: true
+    environment:
+      <<: *common-env
+      PIPELINE_CMD: evaluate
     env_file:
       - path: .env
         required: false
-    environment:
-      PIPELINE_CMD: evaluate
-      DATASET: ${DATASET:-}
-      # Predictions path; empty = auto-detect newest runs/<timestamp>/predictions.jsonl
-      PREDICTIONS: ${PREDICTIONS:-}
-      EVAL_RUN_ID: ${EVAL_RUN_ID:-bench-docker}
-      EVAL_WORKERS: ${EVAL_WORKERS:-4}
-      HF_HOME: /root/.cache/huggingface
     volumes:
       - ./runs:/app/runs
-      # Live pipeline sources (override the baked copies, so edits need no rebuild).
-      - ./src/run_bench.py:/app/run_bench.py:ro
-      - ./src/pi_logging.py:/app/pi_logging.py:ro
-      - ./src/benchmarks:/app/benchmarks:ro
       # The harness writes logs/run_evaluation/<run_id>.*/report.json here.
       - ./logs:/app/logs
-      - hf-cache:/root/.cache/huggingface
       # The harness builds & runs per-instance images, so it needs the daemon.
       # On Docker Desktop this socket is available inside containers as-is.
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./src/run_bench.py:/app/run_bench.py:ro
+      - ./src/pi_logging.py:/app/pi_logging.py:ro
+      - ./src/benchmarks:/app/benchmarks:ro
+      - hf-cache:/root/.cache/huggingface
+
+  # ---- Summarize a harness report (reads the newest logs/ report) -----------
+  report:
+    profiles: ["eval"]
+    build:
+      context: .
+      target: base
+      args:
+        PI_VERSION: ${PI_VERSION:-latest}
+    image: bench:latest
+    init: true
+    environment:
+      <<: *common-env
+      PIPELINE_CMD: report
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./logs:/app/logs
+      - ./src/run_bench.py:/app/run_bench.py:ro
+      - ./src/pi_logging.py:/app/pi_logging.py:ro
+      - ./src/benchmarks:/app/benchmarks:ro
 
 volumes:
   hf-cache:

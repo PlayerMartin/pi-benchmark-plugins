@@ -68,12 +68,13 @@ python src/run_bench.py run --dataset swebench:SWE-bench/SWE-bench_Lite \
     --skip 10 --limit 5 --agent pi --agent-model sonnet:high --model-name pi-agent \
     --agent-timeout 1800
 
-# Evaluate a predictions file (what this needs depends on the benchmark)
+# Evaluate a predictions file (what this needs depends on the benchmark;
+# --predictions defaults to the newest runs/<timestamp>/predictions.jsonl)
 python src/run_bench.py evaluate \
     --predictions runs/<timestamp>/predictions.jsonl \
     --dataset swebench:SWE-bench/SWE-bench_Lite
 
-# Summarize harness output
+# Summarize harness output (--run-id defaults to the newest report in logs/)
 python src/run_bench.py report --run-id <run-id> --dataset swebench:SWE-bench/SWE-bench_Lite
 ```
 
@@ -84,78 +85,78 @@ evaluation; `src/agents/base.py` for agents) and register it.
 ## Docker
 
 The container packages Python, git, Node and the Pi CLI, so the host needs only
-Docker. It mirrors the two halves of the pipeline:
+Docker. The three pipeline stages are three compose services:
 
-| Service    | Image          | Runs                          | Needs                  |
-|------------|----------------|-------------------------------|------------------------|
-| `runner`   | `bench:latest` | steps 1-4 (`list`, `run`)     | Pi credentials         |
-| `evaluate` | `bench:eval`   | step 5 (`evaluate`, `report`) | Linux + Docker daemon  |
-
+| Service   | Image          | Runs                          | Needs                  |
+|-----------|----------------|-------------------------------|------------------------|
+| `run`     | `bench:latest` | steps 1-4                     | Pi credentials         |
+| `eval`    | `bench:eval`   | step 5 (harness)              | Linux + Docker daemon  |
+| `report`  | `bench:latest` | step 5 summary                | —                      |
 ### Quick start
 
 ```bash
-cp .env.example .env          # then set AGENT_MODEL, MODEL_NAME and a provider key / PI_HOME
+cp .env.example .env        # then set DATASET, AGENT_MODEL, MODEL_NAME and a provider key (or PI_HOME)
 
-# Inspect instances
-docker compose run --rm runner list --limit 10
-
-# Run steps 1-4 using the .env defaults
-docker compose up runner
-
-# Run with explicit args (overrides .env)
-docker compose run --rm runner run --limit 5 --agent pi --agent-model sonnet:high --model-name pi-agent --agent-timeout 1800
-
-# Step 5: evaluate the predictions (uses the mounted Docker daemon)
-docker compose --profile eval run --rm evaluate
-docker compose --profile eval run --rm evaluate report
+docker compose up run        # steps 1-4: agent -> runs/<timestamp>/predictions.jsonl
+docker compose up eval      # step 5: evaluate the newest predictions
+docker compose up report    # summarize the newest report in logs/
 ```
 
-`docker compose run` forwards trailing arguments verbatim to the Python CLI, so
-the full command-line interface is always available. Running the service with no
-arguments (`docker compose up runner`) assembles the command from environment
-variables instead.
+`eval` auto-detects the newest `runs/<timestamp>/predictions.jsonl` and
+`report` the newest report in `logs/`, so the three commands chain without
+any extra configuration.
+
+`eval` and `report` sit behind the `eval` profile; naming the service on the
+docker compose command line activates its profile automatically (Compose >=
+2.5), while a bare `docker compose up` still only runs `run`.
+
+### Everything else: CLI passthrough
+
+`docker compose run` forwards trailing arguments verbatim to the Python CLI,
+so the full command-line interface is always available:
+
+```bash
+docker compose run --rm run list --limit 10
+docker compose run --rm run --skip 10 --limit 5 --agent-timeout 1800
+```
+
+Values not in `.env` still have defaults and can be overridden ad hoc:
+`AGENT_TIMEOUT=300 LIMIT=3 docker compose up run`.
 
 ### Configuration
 
-All knobs live in `.env` (see `.env.example` for the annotated list). The most
-important ones:
+`.env` holds only what has no default (see `.env.example`):
 
-| Variable          | Default                          | Meaning                                            |
-|-------------------|----------------------------------|----------------------------------------------------|
-| `PIPELINE_CMD`    | `run`                            | `list` \| `run` \| `evaluate` \| `report`            |
-| `AGENT`           | `pi`                             | Agent runner (see `src/agents/`)                  |
-| `AGENT_MODEL`     | — (required for `run`)           | Model for the agent, e.g. `sonnet:high`           |
-| `MODEL_NAME`      | — (required for `run`)           | Name recorded in predictions and reports (no default) |
-| `AGENT_TIMEOUT`   | `1800`                           | Seconds per instance                               |
-| `AGENT_EXTRA_ARGS`| —                                | Extra args appended verbatim to the agent           |
-| `LIMIT`           | `0`                              | Take the next N instances after `SKIP`; `0` = all |
-| `SKIP`            | `0`                              | Skip the first N instances                         |
-| `DATASET`         | — (required)                     | `benchmark:dataset`, e.g. `swebench:SWE-bench/SWE-bench_Lite` |
-| `PI_HOME`         | `./.pi-home`                     | Host Pi home `~/.pi` (contains `agent/`)            |
-| `EVAL_RUN_ID`     | `bench-docker`                   | Run id / report prefix for the harness             |
-| `EVAL_WORKERS`    | `4`                              | Parallel harness workers                           |
+| Variable       | Default        | Meaning                                            |
+|---------------|----------------|----------------------------------------------------|
+| `DATASET`     | — (required)   | `benchmark:dataset`, e.g. `swebench:SWE-bench/SWE-bench_Lite` |
+| `AGENT_MODEL` | — (required for `run`) | Model for the agent, e.g. `sonnet:high`   |
+| `MODEL_NAME`  | — (required for `run`) | Name recorded in predictions and reports   |
+| `LIMIT`       | `0`            | Take the next N instances; `0` = all                |
 
-Credentials (`HF_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, ...) are read
-from the same `.env` and passed into the container.
+Plus credentials: one provider API key (`ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, ...) or `PI_HOME` pointing at your host `~/.pi`.
+
+Ad-hoc-only knobs (defaults live in `docker-compose.yml`): `AGENT` (`pi`),
+`AGENT_TIMEOUT` (`1800`), `AGENT_EXTRA_ARGS` (empty), `SKIP` (`0`),
+`EVAL_WORKERS` (`4`).
 
 ### Volumes
 
 - `./runs` — pipeline output: one timestamped directory per run
   (`run.json`, `predictions.jsonl`, `manifest.json`, `workspaces/`, `logs/`)
   plus the shared `mirrors/`. Persists on the host.
-- `${PI_HOME}` — your host Pi home `~/.pi`,
-  mounted at `/root/.pi`. Pi reads its config from `~/.pi/agent`, so point this
-  at the home directory (not the `agent` subdir) to reuse existing logins and
-  custom providers; or leave it and run `docker compose run --rm runner auth login`
-  once. `PI_AGENT_DIR` remains a legacy alias.
+- `${PI_HOME:-./.pi-home}` — your host Pi home `~/.pi`, mounted at `/root/.pi`.
+  Pi reads its config from `~/.pi/agent`, so point this at the home directory
+  (not the `agent` subdir) to reuse existing logins and custom providers; or
+  leave it and run `docker compose run --rm run auth login` once.
 - `hf-cache` — named volume caching downloaded HF datasets.
 - `./logs` — harness reports (written by the evaluation harness).
 
 ### Notes
 
-- The `evaluate` service mounts `/var/run/docker.sock` because the bundled
-  SWE-bench harness builds and runs per-instance images. It is gated behind the
-  `eval` profile so it never starts with a plain `docker compose up`.
+- The `eval` service mounts `/var/run/docker.sock` because the bundled
+  SWE-bench harness builds and runs per-instance images.
 - On Linux without Docker Desktop, the socket mount requires the daemon to be
   reachable from the container; the container connects as root.
 - Build the images individually if you prefer:

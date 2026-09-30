@@ -123,23 +123,34 @@ class SWEBenchBenchmark(Benchmark):
         proc = subprocess.run(cmd)
         return proc.returncode
 
-    def summarize_report(self, run_id: str) -> int:
+    def summarize_report(self, run_id: str | None) -> int:
         """Best-effort: find the harness report and print a summary.
+
+        ``run_id=None`` summarizes the newest report in ``logs/``.
 
         Handles both report shapes produced by SWE-bench >= 5:
           * aggregate      logs/<model>.<run_id>.json              (schema_version 2)
           * per-instance   logs/run_evaluation/<run_id>/<model>/<instance>/report.json
         plus the legacy  logs/run_evaluation/<run_id>*/report.json.
         """
+        if run_id:
+            pats = (
+                f"logs/*.{run_id}*.json",
+                f"logs/run_evaluation/{run_id}*/**/report.json",
+                f"logs/run_evaluation/{run_id}*/report.json",
+            )
+        else:
+            pats = (
+                "logs/*.json",
+                "logs/run_evaluation/**/report.json",
+            )
         found: dict[Path, None] = {}
-        for pat in (
-            f"logs/*.{run_id}*.json",
-            f"logs/run_evaluation/{run_id}*/**/report.json",
-            f"logs/run_evaluation/{run_id}*/report.json",
-        ):
+        for pat in pats:
             for p in Path(".").glob(pat):
                 found[p.resolve()] = None
-        candidates = sorted(found, key=lambda p: p.stat().st_mtime, reverse=True)
+        candidates = sorted(
+            found, key=lambda p: (p.stat().st_mtime, str(p)), reverse=True
+        )
 
         if not candidates:
             log(

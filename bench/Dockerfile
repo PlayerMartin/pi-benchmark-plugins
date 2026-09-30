@@ -1,14 +1,13 @@
 # syntax=docker/dockerfile:1
 #
-# bench runner.
+# bench pipeline images (wired up in docker-compose.yml; no need to build by hand).
 #
-#   base     -> steps 1-4: dataset loader, repo preparer, agent runner, predictions
-#   swebench -> base + the SWE-bench evaluation harness + Docker CLI (step 5)
+#   base     -> `docker compose up run` / `report`: steps 1-4 + report summaries
+#   swebench -> base + the SWE-bench harness + Docker CLI: `docker compose up eval`
 #
-# Build the runner:    docker build --target base     -t bench:latest .
-# Build the evaluator: docker build --target swebench -t bench:eval   .
-#
-# Both are wired up in docker-compose.yml; you normally do not build by hand.
+# Build manually if you prefer:
+#   docker build --target base     -t bench:latest .
+#   docker build --target swebench -t bench:eval   .
 
 # ---------------------------------------------------------------------------
 # Stage 0: grab a static Docker CLI so the evaluator can talk to the host daemon

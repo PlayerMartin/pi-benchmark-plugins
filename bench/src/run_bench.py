@@ -23,9 +23,12 @@ Usage:
     python run_bench.py run --dataset <benchmark>:<dataset> \
         --skip 10 --limit 5 --agent <name> --agent-model <model> \
         --model-name <name>
-    python run_bench.py evaluate --predictions runs/<timestamp>/predictions.jsonl \
-        --dataset <benchmark>:<dataset>
-    python run_bench.py report --run-id <run-id> --dataset <benchmark>:<dataset>
+    python run_bench.py evaluate --dataset <benchmark>:<dataset> \
+        [--predictions runs/<timestamp>/predictions.jsonl]
+    python run_bench.py report --dataset <benchmark>:<dataset> [--run-id <run-id>]
+
+    (evaluate defaults to the newest runs/<timestamp>/predictions.jsonl;
+     report defaults to the newest report in logs/.)
 
 Module layout:
     patch_utils    diff capture/cleaning (git diff -> patch text)
