@@ -46,9 +46,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
-import stat
 import subprocess
 import sys
 import time
@@ -62,6 +60,12 @@ from benchmarks import (
     resolve_dataset,
 )
 from pi_logging import log
+from repo_prep import (
+    ensure_mirror,
+    git,
+    prepare_workspace,
+    robust_rmtree,
+)
 
 # Step 1 (dataset loading) lives in the `benchmarks` package; InstanceSpec,
 # load_instances and resolve_dataset are imported from it. There is no default
@@ -89,38 +93,9 @@ class RunResult:
 
 
 # ---------------------------------------------------------------------------
-# Small helpers (logging lives in pi_logging)
+# Small helpers (repo/git plumbing and workspace preparation live in repo_prep;
+# logging lives in pi_logging)
 # ---------------------------------------------------------------------------
-
-
-def run_cmd(
-    args: list[str],
-    cwd: Optional[Path] = None,
-    timeout: Optional[int] = None,
-    stdin_text: Optional[str] = None,
-) -> subprocess.CompletedProcess:
-    """Run a subprocess; never raises on nonzero exit (caller checks .returncode)."""
-    return subprocess.run(
-        args,
-        cwd=str(cwd) if cwd else None,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-        input=stdin_text,
-    )
-
-
-def git(cwd: Path, *args: str, check: bool = True) -> str:
-    """Run a git command in `cwd`; returns stdout, raises on failure if check."""
-    proc = run_cmd(["git", *args], cwd=cwd)
-    if check and proc.returncode != 0:
-        raise RuntimeError(
-            f"git {' '.join(args)} failed (exit {proc.returncode}):\n"
-            f"{proc.stderr.strip()[:2000]}"
-        )
-    return proc.stdout
 
 
 def resolve_pi_cmd(explicit: Optional[str]) -> str:
@@ -137,82 +112,6 @@ def resolve_pi_cmd(explicit: Optional[str]) -> str:
         "`npm install -g @earendil-works/pi-coding-agent` or pass --pi-cmd."
     )
 
-
-def _force_delete(func, target: str, _exc) -> None:
-    """rmtree callback: clear the read-only bit (git pack files) and retry."""
-    os.chmod(target, stat.S_IWRITE)
-    func(target)
-
-
-def robust_rmtree(path: Path) -> None:
-    """rmtree that survives Windows read-only files (git internals)."""
-    try:
-        shutil.rmtree(path, onexc=_force_delete)  # Python >= 3.12
-    except TypeError:  # noqa: PERF203 - Python < 3.12 fallback
-        shutil.rmtree(path, onerror=_force_delete)
-
-
-# ---------------------------------------------------------------------------
-# Step 2: Repo preparer -> Isolated workspace
-# ---------------------------------------------------------------------------
-
-
-def repo_url(repo: str) -> str:
-    return f"https://github.com/{repo}.git"
-
-
-def ensure_mirror(repo: str, mirror_dir: Path, refresh: bool = False) -> Path:
-    """
-    Maintain a local bare mirror of the repo (cloned once, fetched on demand).
-    Mirrors live outside per-run workspaces, so every workspace still gets a
-    pristine checkout at base_commit with zero dirty state.
-    """
-    mirror = mirror_dir / f"{repo.replace('/', '__')}.git"
-    if not mirror.exists():
-        log(f"  cloning mirror of {repo} (one-time) ...")
-        run_git_checked(["git", "clone", "--mirror", repo_url(repo), str(mirror)])
-    elif refresh:
-        log(f"  refreshing mirror of {repo} ...")
-        proc = run_cmd(["git", "-C", str(mirror), "fetch", "--prune", "origin"])
-        if proc.returncode != 0:
-            log(f"  WARNING: mirror fetch failed for {repo}: {proc.stderr[:300]}")
-    return mirror
-
-
-def run_git_checked(args: list[str]) -> None:
-    proc = run_cmd(args)
-    if proc.returncode != 0:
-        raise RuntimeError(f"{' '.join(args[:4])} ... failed:\n{proc.stderr[:2000]}")
-
-
-def prepare_workspace(spec: InstanceSpec, mirror: Path, workspace: Path) -> None:
-    """Fresh clone from the local mirror, checked out at base_commit."""
-    if workspace.exists():
-        robust_rmtree(workspace)
-
-    run_git_checked(
-        [
-            "git",
-            "-c",
-            "core.autocrlf=false",
-            "clone",
-            "--quiet",
-            "--no-local",  # force real file copy so workspace never shares refs with mirror
-            str(mirror),
-            str(workspace),
-        ]
-    )
-    # Normalize line endings & detach HEAD at the base commit.
-    git(workspace, "config", "core.autocrlf", "false")
-    git(workspace, "checkout", "--quiet", "--detach", spec.base_commit)
-    git(workspace, "config", "advice.detachedHead", "false")
-
-    head = git(workspace, "rev-parse", "HEAD").strip()
-    if head != spec.base_commit:
-        raise RuntimeError(f"HEAD {head} != base_commit {spec.base_commit} (drift!)")
-    status = git(workspace, "status", "--porcelain")
-    if status.strip():
-        raise RuntimeError(f"workspace is dirty after clone:\n{status[:500]}")
 
 
 # ---------------------------------------------------------------------------
