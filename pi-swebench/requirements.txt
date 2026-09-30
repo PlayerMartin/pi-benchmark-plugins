@@ -1,0 +1,6 @@
+# Core pipeline (dataset loading only)
+datasets>=2.14
+huggingface_hub
+
+# Evaluation harness (step 5) — needs Docker + Linux/WSL
+# swebench

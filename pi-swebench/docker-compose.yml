@@ -1,0 +1,92 @@
+# docker compose for the Pi x SWE-bench pipeline.
+#
+#   cp .env.example .env      # then edit .env (PI_MODEL + credentials)
+#
+#   docker compose run --rm pi list --limit 10        # inspect instances
+#   docker compose up pi                              # run steps 1-4 (uses .env)
+#   docker compose run --rm pi run --limit 5          # explicit CLI args
+#   docker compose --profile eval run --rm evaluate   # step 5 (needs Docker daemon)
+#   docker compose --profile eval run --rm evaluate report
+#
+# `docker compose run` forwards any trailing args verbatim to the Python CLI,
+# bypassing the environment-variable defaults.
+name: pi-swebench
+
+x-pipeline-env: &pipeline-env
+  PIPELINE_CMD: ${PIPELINE_CMD:-run}
+  DATASET: ${DATASET:-}
+  INSTANCES: ${INSTANCES:-}
+  LIMIT: ${LIMIT:-0}
+  PI_MODEL: ${PI_MODEL:-}
+  PI_TIMEOUT: ${PI_TIMEOUT:-1800}
+  PI_EXTRA_ARGS: ${PI_EXTRA_ARGS:-}
+  HF_HOME: /root/.cache/huggingface
+
+services:
+  # ---- Steps 1-4: dataset -> workspace -> Pi -> predictions.jsonl ----------
+  pi:
+    build:
+      context: .
+      target: base
+      args:
+        PI_VERSION: ${PI_VERSION:-latest}
+    image: pi-swebench:latest
+    init: true
+    env_file:
+      # Optional: carries HF_TOKEN and provider API keys. Missing file is fine.
+      - path: .env
+        required: false
+    environment:
+      <<: *pipeline-env
+    volumes:
+      # Pipeline output persists on the host (predictions.jsonl, manifest, logs).
+      - ./runs:/app/runs
+      # Live pipeline sources (override the baked copies, so edits need no rebuild).
+      - ./src/run_pi_swebench.py:/app/run_pi_swebench.py:ro
+      - ./src/pi_logging.py:/app/pi_logging.py:ro
+      - ./src/benchmarks:/app/benchmarks:ro
+      # Pi home dir (~/.pi). Pi resolves its config at ~/.pi/agent, so mount the
+      # home (not the agent subdir) and models.json / auth.json land correctly.
+      # PI_AGENT_DIR is kept as a legacy alias.
+      - ${PI_HOME:-${PI_AGENT_DIR:-./.pi-home}}:/root/.pi
+      # Dataset cache so we do not re-download SWE-bench on every run.
+      - hf-cache:/root/.cache/huggingface
+
+  # ---- Step 5: official SWE-bench harness (Linux + Docker required) --------
+  # Gated behind the "eval" profile so it never starts with `docker compose up`.
+  evaluate:
+    profiles: ["eval"]
+    build:
+      context: .
+      target: swebench
+      args:
+        PI_VERSION: ${PI_VERSION:-latest}
+    image: pi-swebench:eval
+    init: true
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PIPELINE_CMD: evaluate
+      DATASET: ${DATASET:-}
+      # Predictions path; empty = auto-detect newest runs/<timestamp>/predictions.jsonl
+      PREDICTIONS: ${PREDICTIONS:-}
+      EVAL_RUN_ID: ${EVAL_RUN_ID:-pi-docker}
+      EVAL_WORKERS: ${EVAL_WORKERS:-4}
+      EVAL_EXTRA_ARGS: ${EVAL_EXTRA_ARGS:-}
+      HF_HOME: /root/.cache/huggingface
+    volumes:
+      - ./runs:/app/runs
+      # Live pipeline sources (override the baked copies, so edits need no rebuild).
+      - ./src/run_pi_swebench.py:/app/run_pi_swebench.py:ro
+      - ./src/pi_logging.py:/app/pi_logging.py:ro
+      - ./src/benchmarks:/app/benchmarks:ro
+      # The harness writes logs/run_evaluation/<run_id>.*/report.json here.
+      - ./logs:/app/logs
+      - hf-cache:/root/.cache/huggingface
+      # The harness builds & runs per-instance images, so it needs the daemon.
+      # On Docker Desktop this socket is available inside containers as-is.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  hf-cache:

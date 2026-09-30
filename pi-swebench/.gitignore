@@ -1,0 +1,13 @@
+# Local config + secrets
+.env
+
+# Pipeline output
+runs/
+logs/
+
+# Pi home when mounted locally (PI_HOME default)
+.pi-home/
+
+# Python
+__pycache__/
+*.pyc

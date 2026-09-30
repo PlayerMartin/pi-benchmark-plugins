@@ -1,0 +1,10 @@
+# Build context exclusions for the Pi x SWE-bench image.
+runs/
+logs/
+__pycache__/
+**/__pycache__/
+*.pyc
+**/*.pyc
+.env
+.git
+.gitignore
