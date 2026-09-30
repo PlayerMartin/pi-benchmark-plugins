@@ -66,10 +66,11 @@ case "$cmd" in
         ;;
     run)
         add_selection
-        : "${PI_MODEL:?PI_MODEL is required for 'run', e.g. PI_MODEL=sonnet:high}"
-        args+=(--pi-model "$PI_MODEL")
-        args+=(--pi-timeout "${PI_TIMEOUT:-1800}")
-        [[ -n "${PI_EXTRA_ARGS:-}" ]] && args+=(--pi-extra-args "$PI_EXTRA_ARGS")
+        : "${AGENT_MODEL:?AGENT_MODEL is required for 'run', e.g. AGENT_MODEL=sonnet:high}"
+        args+=(--agent "${AGENT:-pi}")
+        args+=(--agent-model "$AGENT_MODEL")
+        args+=(--agent-timeout "${AGENT_TIMEOUT:-1800}")
+        [[ -n "${AGENT_EXTRA_ARGS:-}" ]] && args+=(--agent-extra-args "$AGENT_EXTRA_ARGS")
         ;;
     evaluate)
         if [[ -z "${DATASET:-}" ]]; then

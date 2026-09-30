@@ -1,8 +1,6 @@
 """Git plumbing for benchmark runs: local mirrors and per-instance workspaces."""
 
-import os
 import shutil
-import stat
 import subprocess
 from pathlib import Path
 
@@ -32,13 +30,8 @@ def git(cwd: Path, *args: str, check: bool = True) -> str:
 
 
 def robust_rmtree(path: Path) -> None:
-    """rmtree that survives Windows read-only files (git internals)."""
-
-    def force_delete(func, target: str, _exc) -> None:
-        os.chmod(target, stat.S_IWRITE)
-        func(target)
-
-    shutil.rmtree(path, onexc=force_delete)
+    """Best-effort workspace cleanup; never fails the run."""
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def run_git_checked(args: list[str]) -> None:
@@ -73,7 +66,7 @@ def prepare_workspace(spec: InstanceSpec, mirror: Path, workspace: Path) -> None
             "core.autocrlf=false",
             "clone",
             "--quiet",
-            "--no-local",  # real file copy: workspace never shares refs with mirror
+            "--no-local",  # workspace must not share refs with the mirror
             str(mirror),
             str(workspace),
         ]

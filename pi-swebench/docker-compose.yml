@@ -1,6 +1,6 @@
 # docker compose for the Pi x SWE-bench pipeline.
 #
-#   cp .env.example .env      # then edit .env (PI_MODEL + credentials)
+#   cp .env.example .env      # then edit .env (AGENT_MODEL + credentials)
 #
 #   docker compose run --rm pi list --limit 10        # inspect instances
 #   docker compose up pi                              # run steps 1-4 (uses .env)
@@ -17,9 +17,10 @@ x-pipeline-env: &pipeline-env
   DATASET: ${DATASET:-}
   INSTANCES: ${INSTANCES:-}
   LIMIT: ${LIMIT:-0}
-  PI_MODEL: ${PI_MODEL:-}
-  PI_TIMEOUT: ${PI_TIMEOUT:-1800}
-  PI_EXTRA_ARGS: ${PI_EXTRA_ARGS:-}
+  AGENT: ${AGENT:-pi}
+  AGENT_MODEL: ${AGENT_MODEL:-}
+  AGENT_TIMEOUT: ${AGENT_TIMEOUT:-1800}
+  AGENT_EXTRA_ARGS: ${AGENT_EXTRA_ARGS:-}
   HF_HOME: /root/.cache/huggingface
 
 services:

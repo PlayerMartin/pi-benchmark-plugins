@@ -1,52 +1,33 @@
 #!/usr/bin/env python3
-"""
-Automatic SWE-bench testing framework for the Pi coding agent.
+"""SWE-bench testing framework for coding agents.
 
 Pipeline (one instance at a time):
 
-  1. DATASET LOADER    -> load instance spec (instance_id, repo, base_commit,
-                          problem_statement) from a SWE-bench dataset on HF.
-  2. REPO PREPARER     -> fresh clone of the repo at base_commit into an
-                          isolated workspace directory (per-run, no dirty state).
-  3. PI AGENT RUNNER   -> run `pi --mode json` with the problem_statement as
-                          the task prompt, inside the workspace, under a
-                          timeout. The full event stream (every LLM message,
-                          tool call and tool result, plus token usage/cost) is
-                          captured to logs/<instance>/events.jsonl and rendered
-                          to a readable transcript.md.
-  4. FORMATTER         -> capture `git diff` vs base_commit as a unified diff
-                          (staged incl. untracked, binaries dropped) and write
-                          the SWE-bench predictions JSONL.
-  5. EVALUATION        -> hand the predictions to the SWE-bench harness
-                          (Docker + Linux / WSL required) and report results.
+  1. DATASET LOADER -> instance specs (see the `benchmarks` package)
+  2. REPO PREPARER  -> fresh clone at base_commit into a workspace
+  3. AGENT RUNNER   -> the selected agent works on the issue (see `agents`)
+  4. FORMATTER      -> git diff vs base_commit -> predictions JSONL
+  5. EVALUATION     -> SWE-bench harness (Docker required)
 
-Each `run` invocation writes everything into one timestamped directory:
+Each `run` writes everything into one timestamped directory:
 
     runs/<YYYYmmdd-HHMMSS>/
-      run.json                  # run metadata: model, dataset, instances
-      predictions.jsonl
-      manifest.json             # results, totals (cost/tokens), status
-      logs/<instance_id>/
-        meta.json              # model, task, prompt, status, usage, artifacts
-        events.jsonl           # full pi event stream (all LLM instructions)
-        transcript.md          # human-readable chat history
-        patch.diff
-        pi.stderr.log
+      run.json, predictions.jsonl, manifest.json
+      logs/<instance_id>/   meta.json, events.jsonl, transcript.md, patch.diff
 
-Usage examples:
+Usage:
     python run_pi_swebench.py list --dataset swebench:SWE-bench/SWE-bench_Lite --limit 10
     python run_pi_swebench.py run --dataset swebench:SWE-bench/SWE-bench_Lite \
-        --skip 10 --limit 5 --pi-model sonnet:high
+        --skip 10 --limit 5 --agent pi --agent-model sonnet:high
     python run_pi_swebench.py evaluate --predictions runs/<timestamp>/predictions.jsonl \
         --dataset swebench:SWE-bench/SWE-bench_Lite
-    python run_pi_swebench.py report --run-dir runs
+    python run_pi_swebench.py report --run-id <run-id>
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import subprocess
 import sys
 import time
@@ -54,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from agents import AgentRunner, get_agent
 from benchmarks import (
     InstanceSpec,
     load_instances,
@@ -67,24 +49,17 @@ from repo_prep import (
     robust_rmtree,
 )
 
-# Step 1 (dataset loading) lives in the `benchmarks` package; InstanceSpec,
-# load_instances and resolve_dataset are imported from it. There is no default
-# dataset: --dataset must be given explicitly.
-
 DEFAULT_SPLIT = "test"
+DEFAULT_AGENT = "pi"
 DEFAULT_MODEL_NAME = "pi-agent"
 DEFAULT_RUN_DIR = "runs"
-DEFAULT_PI_TIMEOUT = 1800  # seconds per instance
-
-# ---------------------------------------------------------------------------
-# Data model (task specs come from the `benchmarks` package)
-# ---------------------------------------------------------------------------
+DEFAULT_AGENT_TIMEOUT = 1800  # seconds per instance
 
 
 @dataclass
 class RunResult:
     instance_id: str
-    status: str  # completed | no_patch | pi_error | pi_timeout | prep_error
+    status: str  # completed | no_patch | agent_error | agent_timeout | prep_error
     duration_s: float = 0.0
     patch: str = ""
     error: str = ""
@@ -92,260 +67,8 @@ class RunResult:
     usage: Optional[dict] = None
 
 
-# ---------------------------------------------------------------------------
-# Small helpers (repo/git plumbing and workspace preparation live in repo_prep;
-# logging lives in pi_logging)
-# ---------------------------------------------------------------------------
-
-
-def resolve_pi_cmd(explicit: Optional[str]) -> str:
-    """Find the pi CLI. On Windows this resolves pi.cmd via PATHEXT."""
-    if explicit:
-        found = shutil.which(explicit) or explicit
-        return found
-    for name in ("pi", "pi.cmd", "pi.exe"):
-        found = shutil.which(name)
-        if found:
-            return found
-    raise FileNotFoundError(
-        "Could not find the 'pi' CLI on PATH. Install it with "
-        "`npm install -g @earendil-works/pi-coding-agent` or pass --pi-cmd."
-    )
-
-
-
-# ---------------------------------------------------------------------------
-# Step 3: Pi agent runner -> (worked on the repo, we capture the diff)
-# ---------------------------------------------------------------------------
-
-
-def build_prompt(spec: InstanceSpec) -> str:
-    return f"""You are an autonomous software engineering agent. Your current working \
-directory is a clone of the repository {spec.repo}.
-
-Resolve the following issue:
-
---- BEGIN ISSUE: {spec.instance_id} ---
-{spec.problem_statement.strip()}
---- END ISSUE ---
-
-Instructions:
-- Edit the source code in this repository to fix the issue described above.
-- Keep the change minimal and focused: only modify what is necessary.
-- You may add new files if needed, and you may inspect, search, and run commands
-  to understand the codebase.
-- Do NOT create git commits, branches, or tags; leave all changes uncommitted
-  in the working tree. Never touch the .git directory.
-- Test dependencies may not be installed in this environment; running the full
-  test suite is optional.
-- Finish with a one-paragraph summary of what you changed and why.
-"""
-
-
-def run_pi(
-    spec: InstanceSpec,
-    workspace: Path,
-    pi_cmd: str,
-    pi_extra_args: list[str],
-    timeout: int,
-    log_dir: Path,
-) -> dict:
-    """
-    Run Pi headless in the workspace in JSON event mode.
-
-    Pi writes its full event stream -- every LLM message (the exact
-    instructions sent and received), every tool call and tool result, plus
-    per-response token usage and cost -- to logs/<instance>/events.jsonl via
-    stdout. The prompt goes in via stdin (avoids Windows command-line length
-    limits); Pi prepends piped stdin to the first prompt. Diagnostics go to
-    pi.stderr.log. Returns a dict with status/detail/duration/usage.
-    """
-    prompt = build_prompt(spec)
-    args = [
-        pi_cmd,
-        "--mode", "json",  # structured event stream on stdout, not final text
-        "--no-session",  # don't pollute the persistent session store
-        *pi_extra_args,
-        "Fix the GitHub issue described below. Work directly in this repository.",
-    ]
-    log_dir.mkdir(parents=True, exist_ok=True)
-    events_file = log_dir / "events.jsonl"
-    stderr_file = log_dir / "pi.stderr.log"
-    start = time.time()
-    with open(events_file, "w", encoding="utf-8") as events_fh, open(
-        stderr_file, "w", encoding="utf-8"
-    ) as stderr_fh:
-        try:
-            proc = subprocess.run(
-                args,
-                cwd=str(workspace),
-                input=prompt,
-                stdout=events_fh,
-                stderr=stderr_fh,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-            )
-            status = "ok" if proc.returncode == 0 else f"pi_error(exit={proc.returncode})"
-            detail = ""
-        except subprocess.TimeoutExpired:
-            status = "pi_timeout"
-            detail = f"Pi did not finish within {timeout}s; partial work kept."
-        except Exception as e:  # noqa: BLE001
-            status = "pi_error"
-            detail = f"{type(e).__name__}: {e}"
-
-        duration = time.time() - start
-        if not detail:
-            tail = stderr_file.read_text(encoding="utf-8", errors="replace").strip()
-            detail = tail[-4000:]
-
-    usage = condense_events(events_file)
-    return {
-        "status": status,
-        "detail": detail,
-        "duration_s": duration,
-        "events_file": str(events_file),
-        "usage": usage,
-    }
-
-
-def condense_events(events_file: Path) -> dict:
-    """
-    Keep events.jsonl compact: drop streaming `message_update` deltas (the
-    authoritative `message_end` records already carry the full messages) and
-    aggregate token usage / cost across assistant responses. Rewrites the
-    file in place; returns the usage totals.
-    """
-    kept: list[str] = []
-    usage = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0,
-        "cost_usd": 0.0,
-        "responses": 0,
-    }
-    pending_usage: dict | None = None
-    text = events_file.read_text(encoding="utf-8", errors="replace")
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue  # truncated tail after a timeout/kill
-        if rec.get("type") == "message_update":
-            if rec.get("usage"):
-                pending_usage = rec["usage"]
-            continue
-        if rec.get("type") == "message_end":
-            msg = rec.get("message") or {}
-            if msg.get("role") == "assistant":
-                u = msg.get("usage") or pending_usage
-                if u:
-                    usage["input_tokens"] += u.get("input", 0)
-                    usage["output_tokens"] += u.get("output", 0)
-                    usage["cache_read_tokens"] += u.get("cacheRead", 0)
-                    usage["cache_write_tokens"] += u.get("cacheWrite", 0)
-                    usage["cost_usd"] += (u.get("cost") or {}).get("total", 0)
-                    usage["responses"] += 1
-                pending_usage = None
-        kept.append(json.dumps(rec))
-    events_file.write_text(
-        "\n".join(kept) + ("\n" if kept else ""), encoding="utf-8"
-    )
-    return usage
-
-
-def render_transcript(
-    events_file: Path,
-    out_path: Path,
-    spec: InstanceSpec,
-    model: str,
-    status: str,
-    duration_s: float,
-    usage: dict,
-) -> None:
-    """Render a human-readable chat history (markdown) from the event stream."""
-
-    def render_content(content) -> str:
-        if isinstance(content, str):
-            return content
-        parts: list[str] = []
-        for block in content or []:
-            btype = block.get("type")
-            if btype == "text":
-                parts.append(block.get("text", ""))
-            elif btype == "thinking":
-                thinking = "\n> ".join(block.get("thinking", "").splitlines())
-                parts.append(f"> [thinking]\n> {thinking}")
-            elif btype == "toolCall":
-                call = json.dumps(block.get("arguments", {}), indent=2)
-                parts.append(f"**tool call `{block.get('name')}`**\n```json\n{call}\n```")
-        return "\n\n".join(p for p in parts if p)
-
-    def render_tool_result(result) -> str:
-        chunks = [
-            block.get("text", "")
-            for block in (result or {}).get("content") or []
-            if block.get("type") == "text"
-        ]
-        text = "\n".join(chunks)
-        if len(text) > 4000:
-            text = (
-                text[:2000]
-                + "\n... [truncated; full result in events.jsonl] ...\n"
-                + text[-1000:]
-            )
-        return text
-
-    lines = [
-        f"# Transcript: {spec.instance_id}",
-        "",
-        f"- **repo**: {spec.repo} @ `{spec.base_commit[:12]}`",
-        f"- **model**: `{model}`",
-        f"- **status**: {status}",
-        f"- **duration**: {duration_s:.0f}s",
-        f"- **usage**: {usage['input_tokens']} in / {usage['output_tokens']} out tokens, "
-        f"${usage['cost_usd']:.4f}, {usage['responses']} responses",
-        "",
-        "---",
-        "",
-    ]
-    text = events_file.read_text(encoding="utf-8", errors="replace")
-    for line in text.splitlines():
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        rtype = rec.get("type")
-        if rtype == "message_end":
-            msg = rec.get("message") or {}
-            lines.append(f"## {msg.get('role', '?').title()}\n")
-            lines.append(render_content(msg.get("content")))
-            lines.append("")
-        elif rtype == "tool_execution_end":
-            name = rec.get("toolName", "?")
-            flag = "error" if rec.get("isError") else "ok"
-            lines.append(f"### tool result `{name}` ({flag})\n")
-            lines.append(f"```\n{render_tool_result(rec.get('result'))}\n```")
-            lines.append("")
-    out_path.write_text("\n".join(lines), encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# Step 4: Formatter -> clean unified diff -> predictions JSONL
-# ---------------------------------------------------------------------------
-
-
 def clean_diff(raw_diff: str) -> str:
-    """
-    Drop binary-file sections and trailing whitespace noise so the harness can
-    `git apply` the patch cleanly. Untracked files are already included because
-    we diff the index (staged with `git add -A`) against base_commit.
-    """
+    """Drop binary-file sections so the harness can `git apply` the patch."""
     if not raw_diff.strip():
         return ""
     sections: list[list[str]] = []
@@ -372,32 +95,22 @@ def in_binary_of(section: list[str]) -> bool:
 
 def capture_patch(spec: InstanceSpec, workspace: Path) -> str:
     """Diff working tree (incl. untracked, incl. accidental commits) vs base."""
-    # Stage everything so untracked files appear; respect .gitignore (noise stays out).
-    git(workspace, "add", "-A")
+    git(workspace, "add", "-A")  # stage everything so untracked files appear
     raw = git(workspace, "diff", "--cached", spec.base_commit)
-    # Leave the workspace as found (staging is harmless, but be tidy).
     git(workspace, "reset", "--quiet", check=False)
     return clean_diff(raw)
 
 
 def write_prediction(out_path: Path, spec: InstanceSpec, patch: str) -> None:
-    """One JSON line: the sole interface into the SWE-bench harness.
-
-    SWE-bench (>=5) expects the patch under the `model_patch` key.
-    """
+    """One JSON line: the sole interface into the SWE-bench harness."""
     record = {
-        "instance_id": spec.instance_id,  # must match the dataset string exactly
+        "instance_id": spec.instance_id,
         "model_name_or_path": DEFAULT_MODEL_NAME,
         "model_patch": patch,
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(record) + "\n")
-
-
-# ---------------------------------------------------------------------------
-# Orchestration: one instance through steps 2-4
-# ---------------------------------------------------------------------------
 
 
 def write_instance_meta(
@@ -410,7 +123,7 @@ def write_instance_meta(
     patch_lines: int,
     error: str,
 ) -> None:
-    """Per-instance metadata: model, task, prompt, status, usage, artifacts."""
+    log_dir.mkdir(parents=True, exist_ok=True)
     meta = {
         "instance_id": spec.instance_id,
         "repo": spec.repo,
@@ -420,16 +133,10 @@ def write_instance_meta(
         "duration_s": round(duration_s, 1),
         "patch_lines": patch_lines,
         "error": error[:2000],
-        "artifacts": {
-            "events": "events.jsonl",
-            "transcript": "transcript.md",
-            "patch": "patch.diff",
-            "stderr": "pi.stderr.log",
-        },
+        "artifacts": sorted(p.name for p in log_dir.iterdir() if p.is_file()),
     }
     if usage:
         meta["usage"] = usage
-    log_dir.mkdir(parents=True, exist_ok=True)
     (log_dir / "meta.json").write_text(
         json.dumps(meta, indent=2), encoding="utf-8"
     )
@@ -438,21 +145,18 @@ def write_instance_meta(
 def process_instance(
     spec: InstanceSpec,
     run_dir: Path,
-    pi_cmd: str,
-    pi_extra_args: list[str],
-    pi_timeout: int,
+    agent: AgentRunner,
+    agent_timeout: int,
     predictions_path: Path,
-    pi_model: str,
 ) -> RunResult:
     log(f"=== {spec.instance_id} ===")
-    # Mirrors are expensive to clone, so they are shared across runs; every
-    # run gets its own timestamped directory with its own logs and workspaces.
     mirror_root = run_dir.parent / "mirrors"
     mirror_root.mkdir(parents=True, exist_ok=True)
     ws_root = run_dir / "workspaces"
     ws_root.mkdir(parents=True, exist_ok=True)
     workspace = ws_root / spec.instance_id
     log_dir = run_dir / "logs" / spec.instance_id
+    log_dir.mkdir(parents=True, exist_ok=True)
     start = time.time()
 
     try:
@@ -461,7 +165,7 @@ def process_instance(
     except Exception as e:  # noqa: BLE001
         log(f"  PREP FAILED: {e}")
         write_instance_meta(
-            log_dir, spec, pi_model, "prep_error", time.time() - start, None, 0, str(e)
+            log_dir, spec, agent.model, "prep_error", time.time() - start, None, 0, str(e)
         )
         return RunResult(
             instance_id=spec.instance_id,
@@ -471,67 +175,48 @@ def process_instance(
             log_dir=str(log_dir),
         )
 
-    outcome = run_pi(spec, workspace, pi_cmd, pi_extra_args, pi_timeout, log_dir)
-    status, detail, usage = outcome["status"], outcome["detail"], outcome["usage"]
+    outcome = agent.run(spec, workspace, log_dir, agent_timeout)
 
     try:
         patch = capture_patch(spec, workspace)
     except Exception as e:  # noqa: BLE001
         log(f"  DIFF CAPTURE FAILED: {e}")
-        render_transcript(
-            log_dir / "events.jsonl",
-            log_dir / "transcript.md",
-            spec,
-            pi_model,
-            status,
-            outcome["duration_s"],
-            usage,
-        )
+        error = f"diff capture: {e}"
         write_instance_meta(
-            log_dir, spec, pi_model, "pi_error", time.time() - start, usage, 0,
-            f"diff capture: {e}",
+            log_dir, spec, agent.model, "agent_error",
+            time.time() - start, outcome.usage, 0, error,
         )
         return RunResult(
             instance_id=spec.instance_id,
-            status="pi_error",
-            error=f"diff capture: {e}",
+            status="agent_error",
+            error=error,
             duration_s=time.time() - start,
             log_dir=str(log_dir),
-            usage=usage,
+            usage=outcome.usage,
         )
 
     patch_file = log_dir / "patch.diff"
     if patch:
         patch_file.write_text(patch, encoding="utf-8")
         write_prediction(predictions_path, spec, patch)
-        final_status = "completed" if status == "ok" else status
+        final_status = "completed" if outcome.status == "ok" else outcome.status
         log(
             f"  patch: {len(patch.splitlines())} diff lines -> {patch_file.name} "
-            f"({final_status}, {time.time() - start:.0f}s, "
-            f"${usage['cost_usd']:.4f})"
+            f"({final_status}, {time.time() - start:.0f}s)"
         )
     else:
-        final_status = "no_patch" if status == "ok" else status
+        final_status = "no_patch" if outcome.status == "ok" else outcome.status
         log(f"  EMPTY PATCH ({final_status}, {time.time() - start:.0f}s)")
 
-    render_transcript(
-        log_dir / "events.jsonl",
-        log_dir / "transcript.md",
-        spec,
-        pi_model,
-        status,
-        outcome["duration_s"],
-        usage,
-    )
     write_instance_meta(
         log_dir,
         spec,
-        pi_model,
+        agent.model,
         final_status,
         time.time() - start,
-        usage,
+        outcome.usage,
         len(patch.splitlines()) if patch else 0,
-        detail if status != "ok" else "",
+        outcome.detail if outcome.status != "ok" else "",
     )
 
     robust_rmtree(workspace)
@@ -541,9 +226,9 @@ def process_instance(
         status=final_status,
         duration_s=time.time() - start,
         patch=patch,
-        error=detail if status != "ok" else "",
+        error=outcome.detail if outcome.status != "ok" else "",
         log_dir=str(log_dir),
-        usage=usage,
+        usage=outcome.usage,
     )
 
 
@@ -556,15 +241,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 1
     log(f"Selected {len(specs)} instance(s): {', '.join(s.instance_id for s in specs)}")
 
-    pi_cmd = resolve_pi_cmd(None)
-    pi_extra_args = ["--model", args.pi_model, *args.pi_extra_args]
+    agent = get_agent(args.agent, args.agent_model, args.agent_extra_args)
     log(
-        f"Pi CLI: {pi_cmd} | model: {args.pi_model} | "
-        f"extra args: {args.pi_extra_args or '(none)'}"
+        f"Agent: {agent.name} | model: {args.agent_model} | "
+        f"extra args: {args.agent_extra_args or '(none)'}"
     )
 
-    # Every run gets its own timestamped directory holding all of its
-    # artifacts: run.json, predictions, per-instance logs, workspaces.
     run_root = Path(DEFAULT_RUN_DIR).resolve()
     run_dir = run_root / time.strftime("%Y%m%d-%H%M%S")
     while run_dir.exists():  # same-second collision
@@ -577,10 +259,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "dataset": resolve_dataset(args.dataset),
         "split": DEFAULT_SPLIT,
-        "pi_cmd": pi_cmd,
-        "pi_model": args.pi_model,
-        "pi_extra_args": args.pi_extra_args,
-        "pi_timeout": args.pi_timeout,
+        "agent": args.agent,
+        "agent_model": args.agent_model,
+        "agent_extra_args": args.agent_extra_args,
+        "agent_timeout": args.agent_timeout,
         "instances": [s.instance_id for s in specs],
     }
     (run_dir / "run.json").write_text(
@@ -593,40 +275,29 @@ def cmd_run(args: argparse.Namespace) -> int:
     results: list[RunResult] = []
     for spec in specs:
         results.append(
-            process_instance(
-                spec,
-                run_dir,
-                pi_cmd,
-                pi_extra_args,
-                args.pi_timeout,
-                predictions_path,
-                args.pi_model,
-            )
+            process_instance(spec, run_dir, agent, args.agent_timeout, predictions_path)
         )
 
-    write_manifest(run_dir, results, args, pi_cmd)
+    write_manifest(run_dir, results, args)
     print_summary(results)
     return 0 if all(r.status == "completed" for r in results) else 2
 
 
 def write_manifest(
-    run_dir: Path, results: list[RunResult], args: argparse.Namespace, pi_cmd: str
+    run_dir: Path, results: list[RunResult], args: argparse.Namespace
 ) -> None:
     manifest = {
         "run_id": run_dir.name,
         "dataset": resolve_dataset(args.dataset),
         "split": DEFAULT_SPLIT,
         "model_name": DEFAULT_MODEL_NAME,
-        "pi_cmd": pi_cmd,
-        "pi_model": args.pi_model,
-        "pi_extra_args": args.pi_extra_args,
-        "pi_timeout": args.pi_timeout,
+        "agent": args.agent,
+        "agent_model": args.agent_model,
+        "agent_extra_args": args.agent_extra_args,
+        "agent_timeout": args.agent_timeout,
         "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "totals": {
             "instances": len(results),
-            "total_cost_usd": round(
-                sum(r.usage["cost_usd"] for r in results if r.usage), 4
-            ),
             "total_input_tokens": sum(
                 r.usage["input_tokens"] for r in results if r.usage
             ),
@@ -667,24 +338,14 @@ def print_summary(results: list[RunResult]) -> None:
     failed = [
         r.instance_id
         for r in results
-        if r.status.endswith("error") or r.status == "pi_timeout"
+        if r.status.endswith("error") or r.status == "agent_timeout"
     ]
     if failed:
         log(f"  errored/timed out: {', '.join(failed)}")
 
 
-# ---------------------------------------------------------------------------
-# Step 5: SWE-bench harness -> Result
-# ---------------------------------------------------------------------------
-
-
 def normalize_predictions(preds: Path) -> Path:
-    """Normalize the predictions file for SWE-bench >= 5.
-
-    The harness reads `model_patch`; some predictions files (and older versions
-    of this script) used `patch`. If any record needs renaming, write a sibling
-    `.normalized.jsonl` and return that path; otherwise return the input.
-    """
+    """Rename legacy 'patch' keys to the 'model_patch' the harness expects."""
     records: list[dict] = []
     needs_fix = False
     for line in preds.read_text(encoding="utf-8").splitlines():
@@ -708,11 +369,7 @@ def normalize_predictions(preds: Path) -> Path:
 
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
-    """Run the SWE-bench harness over the predictions file.
-
-    NOTE: the harness needs Docker and a Linux environment. On Windows run it
-    under WSL by passing e.g. --eval-python "wsl python" (see README).
-    """
+    """Run the SWE-bench harness over the predictions file (needs Docker)."""
     preds = Path(args.predictions)
     if not preds.exists():
         log(f"Predictions file not found: {preds}")
@@ -758,10 +415,10 @@ def cmd_report(args: argparse.Namespace) -> int:
         report_dir = getattr(args, "report_dir", None) or "logs"
         found: dict[Path, None] = {}
         for pat in (
-            f"{report_dir}/*.{args.run_id}*.json",                 # aggregate
-            f"logs/*.{args.run_id}*.json",                         # aggregate fallback
-            f"logs/run_evaluation/{args.run_id}*/**/report.json",  # per-instance
-            f"logs/run_evaluation/{args.run_id}*/report.json",     # legacy
+            f"{report_dir}/*.{args.run_id}*.json",
+            f"logs/*.{args.run_id}*.json",
+            f"logs/run_evaluation/{args.run_id}*/**/report.json",
+            f"logs/run_evaluation/{args.run_id}*/report.json",
         ):
             for p in Path(".").glob(pat):
                 found[p.resolve()] = None
@@ -774,8 +431,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # Prefer the aggregate report (it carries 'resolved_ids').
-    for path in candidates:
+    for path in candidates:  # prefer the aggregate report (has 'resolved_ids')
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
@@ -804,7 +460,6 @@ def cmd_report(args: argparse.Namespace) -> int:
                 log(f"  empty-patch  {iid}")
             return 0
 
-    # No aggregate: summarize every per-instance report we found.
     reports: list[dict] = []
     for path in candidates:
         try:
@@ -836,11 +491,6 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
 def cmd_list(args: argparse.Namespace) -> int:
     specs = load_instances(
         args.dataset, DEFAULT_SPLIT, limit=args.limit, skip=args.skip
@@ -857,12 +507,8 @@ def add_instance_selection(p: argparse.ArgumentParser) -> None:
         required=True,
         help="benchmark:dataset identifier, e.g. swebench:SWE-bench/SWE-bench_Lite",
     )
-    p.add_argument(
-        "--skip", type=int, default=0, help="skip the first N instances"
-    )
-    p.add_argument(
-        "--limit", "-l", type=int, default=0, help="take the next N (0 = all)"
-    )
+    p.add_argument("--skip", type=int, default=0, help="skip the first N instances")
+    p.add_argument("--limit", "-l", type=int, default=0, help="take the next N (0 = all)")
 
 
 def main() -> int:
@@ -878,20 +524,18 @@ def main() -> int:
     p_run = sub.add_parser("run", help="run the full pipeline (steps 1-4)")
     add_instance_selection(p_run)
     p_run.add_argument(
-        "--pi-model",
-        required=True,
-        help="model for Pi, passed as 'pi --model <value>', e.g. sonnet:high",
+        "--agent",
+        default=DEFAULT_AGENT,
+        help="agent runner to use (default: pi)",
     )
     p_run.add_argument(
-        "--pi-extra-args",
-        default="",
-        help="extra args passed verbatim to pi",
+        "--agent-model", required=True, help="model for the agent, e.g. sonnet:high"
     )
     p_run.add_argument(
-        "--pi-timeout",
-        type=int,
-        default=DEFAULT_PI_TIMEOUT,
-        help="seconds per instance",
+        "--agent-extra-args", default="", help="extra args passed verbatim to the agent"
+    )
+    p_run.add_argument(
+        "--agent-timeout", type=int, default=DEFAULT_AGENT_TIMEOUT, help="seconds per instance"
     )
     p_run.set_defaults(func=cmd_run)
 
@@ -905,37 +549,27 @@ def main() -> int:
     p_eval.add_argument(
         "--eval-python",
         default=sys.executable,
-        help="python (or 'wsl python') used to run the harness",
+        help="python interpreter used to run the harness",
     )
     p_eval.add_argument("--eval-extra-args", default="", help="extra harness args")
     p_eval.add_argument(
-        "--report-dir",
-        default="logs",
-        help="harness --report_dir (must be a mounted path; default logs)",
+        "--report-dir", default="logs", help="harness --report_dir (default logs)"
     )
     p_eval.set_defaults(func=cmd_evaluate)
 
     p_rep = sub.add_parser("report", help="summarize a harness report")
     p_rep.add_argument("--run-id", default="pi", help="run id prefix to search for")
-    p_rep.add_argument(
-        "--report-json", default=None, help="explicit path to report.json"
-    )
+    p_rep.add_argument("--report-json", default=None, help="explicit path to report.json")
     p_rep.add_argument(
         "--report-dir", default="logs", help="harness report dir (default logs)"
     )
     p_rep.set_defaults(func=cmd_report)
 
     args = parser.parse_args()
-    if getattr(args, "pi_extra_args", None) and isinstance(args.pi_extra_args, str):
-        args.pi_extra_args = (
-            args.pi_extra_args.split() if args.pi_extra_args.strip() else []
-        )
-    if getattr(args, "eval_extra_args", None) is not None and isinstance(
-        args.eval_extra_args, str
-    ):
-        args.eval_extra_args = (
-            args.eval_extra_args.split() if args.eval_extra_args.strip() else []
-        )
+    for attr in ("agent_extra_args", "eval_extra_args"):
+        value = getattr(args, attr, None)
+        if isinstance(value, str):
+            setattr(args, attr, value.split() if value.strip() else [])
     return args.func(args)
 
 
