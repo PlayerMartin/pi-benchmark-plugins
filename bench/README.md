@@ -1,27 +1,35 @@
-# Pi × SWE-bench: automatic testing framework
+# bench: benchmark testing framework for coding agents
 
-Runs the [Pi coding agent](https://github.com/earendil-works/pi-coding-agent) against
-[SWE-bench_Lite](https://huggingface.co/datasets/SWE-bench/SWE-bench_Lite) (or any
-SWE-bench-format dataset) end-to-end and produces a predictions file the official
-SWE-bench harness can evaluate.
+Runs any coding agent against any benchmark, end-to-end, and produces a
+predictions file the benchmark's evaluation harness can evaluate. Any agent and
+any benchmark can be used, as long as the required wrapper is implemented:
+
+- **benchmark wrapper** (`src/benchmarks/`) — loads instance specs, formats
+  predictions, and optionally evaluates them. Bundled: the
+  [SWE-bench](https://www.swebench.com/) loader (`swebench:` prefix; any
+  SWE-bench-format Hugging Face dataset works).
+- **agent runner** (`src/agents/`) — runs the agent on a problem statement
+  inside a prepared workspace. Bundled: the [Pi coding agent](https://github.com/earendil-works/pi-coding-agent)
+  (`pi`).
 
 ## Architecture
 
 The pipeline runs five steps, one instance at a time:
 
 1. **dataset loader** — load the instance spec (instance_id, repo, base_commit,
-   problem_statement) from a SWE-bench dataset on HF.
+   problem_statement) via the benchmark wrapper.
 2. **repo preparer** — fresh clone of the repo at base_commit into an isolated
    workspace (via a shared local git mirror).
-3. **agent runner** — run the selected agent (default: pi) on the problem
-   statement inside the workspace, under a timeout.
+3. **agent runner** — run the selected agent on the problem statement inside
+   the workspace, under a timeout.
 4. **JSONL formatter** — capture the `git diff` vs base_commit and write the
-   SWE-bench predictions file.
-5. **SWE-bench harness** — evaluate the predictions (Docker, FAIL_TO_PASS /
-   PASS_TO_PASS tests).
+   predictions file (schema defined by the benchmark wrapper).
+5. **evaluation** — evaluate the predictions with the benchmark's own harness
+   (implemented by the wrapper; the bundled SWE-bench one needs Docker and runs
+   FAIL_TO_PASS / PASS_TO_PASS tests).
 
-Both ends of the pipeline are pluggable: step 1 via the `benchmarks` package
-(`--dataset <prefix>:<name>`) and step 3 via the `agents` package
+Steps 1 and 5 are pluggable via the `benchmarks` package
+(`--dataset <prefix>:<name>`), and step 3 via the `agents` package
 (`--agent <name>`).
 
 The connection points from the design doc are enforced in code:
@@ -38,56 +46,64 @@ The connection points from the design doc are enforced in code:
 
 - Python 3.10+ with `pip install -r requirements.txt`
 - Git on PATH
-- Node.js + Pi on PATH (`npm install -g @earendil-works/pi-coding-agent`),
-  with a configured model/provider (`pi auth login`)
-- For step 5 only: a Linux environment with Docker and `pip install swebench`.
+- An agent runner on PATH (the bundled one: Node.js + Pi,
+  `npm install -g @earendil-works/pi-coding-agent`, with a configured
+  model/provider via `pi auth login`)
+- For evaluation, whatever the benchmark's harness needs (the bundled
+  SWE-bench one: a Linux environment with Docker and `pip install swebench`).
 
 ## Usage
 
 ```bash
 # Inspect instances (--dataset is always <benchmark>:<name>; no default)
-python src/run_pi_swebench.py list --dataset swebench:SWE-bench/SWE-bench_Lite --limit 10
+python src/run_bench.py list --dataset swebench:SWE-bench/SWE-bench_Lite --limit 10
 
-# Run the Pi agent on the first 5 instances (steps 1-4)
-python src/run_pi_swebench.py run --dataset swebench:SWE-bench/SWE-bench_Lite \
-    --limit 5 --agent pi --agent-model sonnet:high
+# Run the agent on the first 5 instances
+# (--model-name is required — there is no default model name)
+python src/run_bench.py run --dataset swebench:SWE-bench/SWE-bench_Lite \
+    --limit 5 --agent pi --agent-model sonnet:high --model-name pi-agent
 
 # Instances 11-15, 30 min budget each
-python src/run_pi_swebench.py run --dataset swebench:SWE-bench/SWE-bench_Lite \
-    --skip 10 --limit 5 --agent pi --agent-model sonnet:high --agent-timeout 1800
+python src/run_bench.py run --dataset swebench:SWE-bench/SWE-bench_Lite \
+    --skip 10 --limit 5 --agent pi --agent-model sonnet:high --model-name pi-agent \
+    --agent-timeout 1800
 
-# Evaluate a predictions file (needs Docker)
-python src/run_pi_swebench.py evaluate \
+# Evaluate a predictions file (what this needs depends on the benchmark)
+python src/run_bench.py evaluate \
     --predictions runs/<timestamp>/predictions.jsonl \
     --dataset swebench:SWE-bench/SWE-bench_Lite
 
 # Summarize harness output
-python src/run_pi_swebench.py report --run-id <run-id>
+python src/run_bench.py report --run-id <run-id> --dataset swebench:SWE-bench/SWE-bench_Lite
 ```
+
+To add another benchmark or agent, implement the wrapper interface
+(`src/benchmarks/base.py` for benchmarks — load, prediction format, optional
+evaluation; `src/agents/base.py` for agents) and register it.
 
 ## Docker
 
 The container packages Python, git, Node and the Pi CLI, so the host needs only
 Docker. It mirrors the two halves of the pipeline:
 
-| Service    | Image              | Runs                          | Needs                  |
-|------------|--------------------|-------------------------------|------------------------|
-| `pi`       | `pi-swebench:latest` | steps 1-4 (`list`, `run`)   | Pi credentials         |
-| `evaluate` | `pi-swebench:eval`   | step 5 (`evaluate`, `report`) | Linux + Docker daemon |
+| Service    | Image          | Runs                          | Needs                  |
+|------------|----------------|-------------------------------|------------------------|
+| `runner`   | `bench:latest` | steps 1-4 (`list`, `run`)     | Pi credentials         |
+| `evaluate` | `bench:eval`   | step 5 (`evaluate`, `report`) | Linux + Docker daemon  |
 
 ### Quick start
 
 ```bash
-cp .env.example .env          # then set AGENT_MODEL and a provider key / PI_HOME
+cp .env.example .env          # then set AGENT_MODEL, MODEL_NAME and a provider key / PI_HOME
 
 # Inspect instances
-docker compose run --rm pi list --limit 10
+docker compose run --rm runner list --limit 10
 
 # Run steps 1-4 using the .env defaults
-docker compose up pi
+docker compose up runner
 
 # Run with explicit args (overrides .env)
-docker compose run --rm pi run --limit 5 --agent pi --agent-model sonnet:high --agent-timeout 1800
+docker compose run --rm runner run --limit 5 --agent pi --agent-model sonnet:high --model-name pi-agent --agent-timeout 1800
 
 # Step 5: evaluate the predictions (uses the mounted Docker daemon)
 docker compose --profile eval run --rm evaluate
@@ -96,7 +112,7 @@ docker compose --profile eval run --rm evaluate report
 
 `docker compose run` forwards trailing arguments verbatim to the Python CLI, so
 the full command-line interface is always available. Running the service with no
-arguments (`docker compose up pi`) assembles the command from environment
+arguments (`docker compose up runner`) assembles the command from environment
 variables instead.
 
 ### Configuration
@@ -109,16 +125,15 @@ important ones:
 | `PIPELINE_CMD`    | `run`                            | `list` \| `run` \| `evaluate` \| `report`            |
 | `AGENT`           | `pi`                             | Agent runner (see `src/agents/`)                  |
 | `AGENT_MODEL`     | — (required for `run`)           | Model for the agent, e.g. `sonnet:high`           |
+| `MODEL_NAME`      | — (required for `run`)           | Name recorded in predictions and reports (no default) |
 | `AGENT_TIMEOUT`   | `1800`                           | Seconds per instance                               |
 | `AGENT_EXTRA_ARGS`| —                                | Extra args appended verbatim to the agent           |
 | `LIMIT`           | `0`                              | Take the next N instances after `SKIP`; `0` = all |
 | `SKIP`            | `0`                              | Skip the first N instances                         |
 | `DATASET`         | — (required)                     | `benchmark:dataset`, e.g. `swebench:SWE-bench/SWE-bench_Lite` |
 | `PI_HOME`         | `./.pi-home`                     | Host Pi home `~/.pi` (contains `agent/`)            |
-| `EVAL_RUN_ID`     | `pi-docker`                      | Run id / report prefix for the harness             |
+| `EVAL_RUN_ID`     | `bench-docker`                   | Run id / report prefix for the harness             |
 | `EVAL_WORKERS`    | `4`                              | Parallel harness workers                           |
-| `EVAL_EXTRA_ARGS` | —                                | Extra args forwarded to the harness                |
-| `EVAL_REPORT_DIR` | `logs`                           | Harness `--report_dir` (keep it mounted)           |
 
 Credentials (`HF_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, ...) are read
 from the same `.env` and passed into the container.
@@ -131,22 +146,21 @@ from the same `.env` and passed into the container.
 - `${PI_HOME}` — your host Pi home `~/.pi`,
   mounted at `/root/.pi`. Pi reads its config from `~/.pi/agent`, so point this
   at the home directory (not the `agent` subdir) to reuse existing logins and
-  custom providers; or leave it and run `docker compose run --rm pi auth login`
+  custom providers; or leave it and run `docker compose run --rm runner auth login`
   once. `PI_AGENT_DIR` remains a legacy alias.
 - `hf-cache` — named volume caching downloaded HF datasets.
-- `./logs` — harness reports: aggregate `logs/<model>.<run_id>.json` plus
-  per-instance `logs/run_evaluation/<run_id>/<model>/<instance>/report.json`.
+- `./logs` — harness reports (written by the evaluation harness).
 
 ### Notes
 
-- The `evaluate` service mounts `/var/run/docker.sock` because the SWE-bench
-  harness builds and runs per-instance images. It is gated behind the `eval`
-  profile so it never starts with a plain `docker compose up`.
+- The `evaluate` service mounts `/var/run/docker.sock` because the bundled
+  SWE-bench harness builds and runs per-instance images. It is gated behind the
+  `eval` profile so it never starts with a plain `docker compose up`.
 - On Linux without Docker Desktop, the socket mount requires the daemon to be
   reachable from the container; the container connects as root.
 - Build the images individually if you prefer:
-  `docker build --target base -t pi-swebench:latest .` and
-  `docker build --target swebench -t pi-swebench:eval .`
+  `docker build --target base -t bench:latest .` and
+  `docker build --target swebench -t bench:eval .`
 
 ## Output layout (always `runs/`)
 
@@ -158,17 +172,18 @@ runs/
 ├── mirrors/                      # bare repo mirrors (cloned once, reused across runs)
 └── <YYYYmmdd-HHMMSS>/            # one directory per run
     ├── run.json                   # run metadata: model, dataset, instance list
-    ├── predictions.jsonl          # the sole interface into the SWE-bench harness
+    ├── predictions.jsonl          # the sole interface into the evaluation harness
     ├── manifest.json              # per-instance status, durations, token totals
     ├── workspaces/                # per-instance working clones (deleted after run)
     └── logs/
         └── <instance_id>/
             ├── meta.json          # model, task, prompt, status, usage, artifacts
-            ├── events.jsonl       # full Pi JSON event stream (all LLM messages,
-            │                     #   tool calls, tool results; streaming deltas dropped)
+            ├── events.jsonl       # full agent event stream (all LLM messages,
+            │                     #   tool calls, tool results; written by the
+            │                     #   bundled pi runner)
             ├── transcript.md      # human-readable chat history
             ├── patch.diff         # the captured diff
-            └── pi.stderr.log      # Pi diagnostics
+            └── pi.stderr.log      # agent diagnostics
 ```
 
 `events.jsonl` is the machine-readable record of everything the agent did:
@@ -177,10 +192,12 @@ produced), every tool call with arguments and full results, and per-response
 token usage. `transcript.md` is the same data rendered for reading;
 large tool results are truncated there but complete in `events.jsonl`.
 
-Predictions JSONL schema (one line per instance):
+Predictions JSONL schema — defined by the benchmark wrapper; shown for the
+bundled SWE-bench one (one line per instance, `model_name_or_path` is whatever
+`--model-name` was given):
 
 ```json
-{"instance_id": "django__django-11099", "model_name_or_path": "pi-agent", "model_patch": "diff --git a/..."}
+{"instance_id": "django__django-11099", "model_name_or_path": "my-agent", "model_patch": "diff --git a/..."}
 ```
 
 ## Design notes
@@ -194,29 +211,13 @@ Predictions JSONL schema (one line per instance):
   stream, and condenses it into a transcript; the agent's internal loop is a
   black box — only the diff and the reported status/usage cross the boundary.
   Implement `run()` and call `register_agent()` to add another.
+- **Benchmarks are pluggable**: a `Benchmark` (see `src/benchmarks/base.py`)
+  provides instances, the prediction record format, and (optionally) evaluation
+  and report summaries. Implement `_load()` and `format_prediction()`, call
+  `register_benchmark()`, and select it with `--dataset <prefix>:<name>`.
+- **No implicit identity**: there is no default benchmark, no default dataset,
+  and no default model name — all of them must be supplied explicitly.
 - **Timeouts**: if the agent exceeds `--agent-timeout`, the process is killed but any
   partial edits are still captured as a patch.
 - **Empty patches / errors** are recorded in `manifest.json` (statuses: `completed`,
   `no_patch`, `agent_timeout`, `agent_error`, `prep_error`) and skipped from the JSONL.
-- **Dataset schema**: evaluation requires a SWE-bench >= 5 dataset (the
-  `SWE-bench/...` re-releases), whose rows carry `image`, `eval_type`,
-  `eval_script` and `log_parser`. The legacy `princeton-nlp/...` names are
-  auto-mapped to their `SWE-bench/...` counterparts.
-- **Harness**: evaluation shells out to
-  `python -m swebench.harness.run_evaluation --dataset_name SWE-bench/SWE-bench_Lite
-  --split test --predictions_path ... --run_id ...`. It builds per-instance Docker images,
-  applies the patch on top of `base_commit`, and runs FAIL_TO_PASS / PASS_TO_PASS tests.
-  Full harness output (build logs, test logs, per-instance `report.json`) lands
-  under `logs/run_evaluation/<run_id>/<model>/<instance>/`, and the aggregate
-  report at `logs/<model>.<run_id>.json` (both inside the mounted `./logs`).
-
-## Troubleshooting
-
-- **`pi` not found** — make sure the Pi CLI is on PATH
-  (`npm install -g @earendil-works/pi-coding-agent`).
-- **HF download blocked** — set `HF_ENDPOINT` / `HF_HOME` as needed for your network.
-- **Clone failures** — SWE-bench repos are real GitHub repos; some are large. Mirrors
-  are cached under `runs/mirrors/`; delete one to force a re-clone. Submodules are not
-  initialized (none of the Lite instances need them for the patch itself).
-- **Harness silently skips instances** — always caused by `instance_id` mismatch; this
-  script copies it verbatim from the dataset, so check you evaluated the same dataset/split.

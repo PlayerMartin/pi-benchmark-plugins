@@ -1,4 +1,4 @@
-"""Agent runner registry for the pi-swebench pipeline (step 3: agent runner).
+"""Agent runner registry for the bench pipeline (step 3: agent runner).
 
 Public API:
 

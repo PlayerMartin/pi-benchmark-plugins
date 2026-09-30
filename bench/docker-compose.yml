@@ -1,16 +1,16 @@
-# docker compose for the Pi x SWE-bench pipeline.
+# docker compose for the bench pipeline.
 #
 #   cp .env.example .env      # then edit .env (AGENT_MODEL + credentials)
 #
-#   docker compose run --rm pi list --limit 10        # inspect instances
-#   docker compose up pi                              # run steps 1-4 (uses .env)
-#   docker compose run --rm pi run --limit 5          # explicit CLI args
-#   docker compose --profile eval run --rm evaluate   # step 5 (needs Docker daemon)
+#   docker compose run --rm runner list --limit 10        # inspect instances
+#   docker compose up runner                              # run steps 1-4 (uses .env)
+#   docker compose run --rm runner run --limit 5         # explicit CLI args
+#   docker compose --profile eval run --rm evaluate       # step 5 (needs Docker daemon)
 #   docker compose --profile eval run --rm evaluate report
 #
 # `docker compose run` forwards any trailing args verbatim to the Python CLI,
 # bypassing the environment-variable defaults.
-name: pi-swebench
+name: bench
 
 x-pipeline-env: &pipeline-env
   PIPELINE_CMD: ${PIPELINE_CMD:-run}
@@ -19,19 +19,20 @@ x-pipeline-env: &pipeline-env
   LIMIT: ${LIMIT:-0}
   AGENT: ${AGENT:-pi}
   AGENT_MODEL: ${AGENT_MODEL:-}
+  MODEL_NAME: ${MODEL_NAME:-}
   AGENT_TIMEOUT: ${AGENT_TIMEOUT:-1800}
   AGENT_EXTRA_ARGS: ${AGENT_EXTRA_ARGS:-}
   HF_HOME: /root/.cache/huggingface
 
 services:
-  # ---- Steps 1-4: dataset -> workspace -> Pi -> predictions.jsonl ----------
-  pi:
+  # ---- Steps 1-4: dataset -> workspace -> agent -> predictions.jsonl ---------
+  runner:
     build:
       context: .
       target: base
       args:
         PI_VERSION: ${PI_VERSION:-latest}
-    image: pi-swebench:latest
+    image: bench:latest
     init: true
     env_file:
       # Optional: carries HF_TOKEN and provider API keys. Missing file is fine.
@@ -43,18 +44,19 @@ services:
       # Pipeline output persists on the host (predictions.jsonl, manifest, logs).
       - ./runs:/app/runs
       # Live pipeline sources (override the baked copies, so edits need no rebuild).
-      - ./src/run_pi_swebench.py:/app/run_pi_swebench.py:ro
+      - ./src/run_bench.py:/app/run_bench.py:ro
       - ./src/pi_logging.py:/app/pi_logging.py:ro
       - ./src/benchmarks:/app/benchmarks:ro
       # Pi home dir (~/.pi). Pi resolves its config at ~/.pi/agent, so mount the
       # home (not the agent subdir) and models.json / auth.json land correctly.
       # PI_AGENT_DIR is kept as a legacy alias.
       - ${PI_HOME:-${PI_AGENT_DIR:-./.pi-home}}:/root/.pi
-      # Dataset cache so we do not re-download SWE-bench on every run.
+      # Dataset cache so we do not re-download datasets on every run.
       - hf-cache:/root/.cache/huggingface
 
-  # ---- Step 5: official SWE-bench harness (Linux + Docker required) --------
-  # Gated behind the "eval" profile so it never starts with `docker compose up`.
+  # ---- Step 5: evaluation harness of the bundled SWE-bench benchmark ---------
+  # (Linux + Docker required). Gated behind the "eval" profile so it never
+  # starts with `docker compose up`.
   evaluate:
     profiles: ["eval"]
     build:
@@ -62,7 +64,7 @@ services:
       target: swebench
       args:
         PI_VERSION: ${PI_VERSION:-latest}
-    image: pi-swebench:eval
+    image: bench:eval
     init: true
     env_file:
       - path: .env
@@ -72,14 +74,13 @@ services:
       DATASET: ${DATASET:-}
       # Predictions path; empty = auto-detect newest runs/<timestamp>/predictions.jsonl
       PREDICTIONS: ${PREDICTIONS:-}
-      EVAL_RUN_ID: ${EVAL_RUN_ID:-pi-docker}
+      EVAL_RUN_ID: ${EVAL_RUN_ID:-bench-docker}
       EVAL_WORKERS: ${EVAL_WORKERS:-4}
-      EVAL_EXTRA_ARGS: ${EVAL_EXTRA_ARGS:-}
       HF_HOME: /root/.cache/huggingface
     volumes:
       - ./runs:/app/runs
       # Live pipeline sources (override the baked copies, so edits need no rebuild).
-      - ./src/run_pi_swebench.py:/app/run_pi_swebench.py:ro
+      - ./src/run_bench.py:/app/run_bench.py:ro
       - ./src/pi_logging.py:/app/pi_logging.py:ro
       - ./src/benchmarks:/app/benchmarks:ro
       # The harness writes logs/run_evaluation/<run_id>.*/report.json here.

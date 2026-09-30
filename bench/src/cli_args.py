@@ -1,4 +1,4 @@
-"""CLI argument registration for run_pi_swebench.py."""
+"""CLI argument registration for run_bench.py."""
 
 from __future__ import annotations
 
@@ -31,6 +31,12 @@ def build_parser(
         "--agent-model", required=True, help="model for the agent, e.g. sonnet:high"
     )
     p_run.add_argument(
+        "--model-name",
+        required=True,
+        help="name recorded in predictions and reports (no default); "
+        "identifies the system under test",
+    )
+    p_run.add_argument(
         "--agent-extra-args", default="", help="extra args passed verbatim to the agent"
     )
     p_run.add_argument(
@@ -41,14 +47,23 @@ def build_parser(
     )
     p_run.set_defaults(func=funcs["run"])
 
-    p_eval = sub.add_parser("evaluate", help="run the SWE-bench harness (step 5)")
+    p_eval = sub.add_parser(
+        "evaluate", help="evaluate predictions with the benchmark's harness (step 5)"
+    )
     p_eval.add_argument("--predictions", required=True, help="predictions JSONL path")
     p_eval.add_argument(
         "--dataset", required=True, help="dataset the predictions are from"
     )
+    p_eval.add_argument(
+        "--run-id", default=None, help="evaluation run id (default: auto-generated)"
+    )
+    p_eval.add_argument(
+        "--max-workers", type=int, default=1, help="parallel harness workers"
+    )
     p_eval.set_defaults(func=funcs["evaluate"])
 
     p_rep = sub.add_parser("report", help="summarize a harness report")
+    p_rep.add_argument("--dataset", required=True, help="benchmark the run belongs to")
     p_rep.add_argument("--run-id", required=True, help="harness run id to summarize")
     p_rep.set_defaults(func=funcs["report"])
 
@@ -71,7 +86,7 @@ def _add_instance_selection(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--dataset",
         required=True,
-        help="benchmark:dataset identifier, e.g. swebench:SWE-bench/SWE-bench_Lite",
+        help="benchmark:dataset identifier, e.g. <benchmark>:<name>",
     )
     p.add_argument("--skip", type=int, default=0, help="skip the first N instances")
     p.add_argument(

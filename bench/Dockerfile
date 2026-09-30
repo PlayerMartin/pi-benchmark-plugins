@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1
 #
-# Pi x SWE-bench runner.
+# bench runner.
 #
-#   base     -> steps 1-4: dataset loader, repo preparer, Pi agent, predictions
+#   base     -> steps 1-4: dataset loader, repo preparer, agent runner, predictions
 #   swebench -> base + the SWE-bench evaluation harness + Docker CLI (step 5)
 #
-# Build the runner:   docker build --target base     -t pi-swebench:latest .
-# Build the evaluator: docker build --target swebench -t pi-swebench:eval   .
+# Build the runner:    docker build --target base     -t bench:latest .
+# Build the evaluator: docker build --target swebench -t bench:eval   .
 #
 # Both are wired up in docker-compose.yml; you normally do not build by hand.
 
@@ -25,7 +25,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG PI_VERSION=latest
 
 # Python drives the pipeline; git drives the workspaces; bash drives the entrypoint.
-# build-essential is needed to compile wheels for the (optional) swebench stage.
+# build-essential is needed to compile wheels for the (optional) evaluation stage.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       python3 \

@@ -1,4 +1,4 @@
-"""Shared logging for the pi-swebench pipeline.
+"""Shared logging for the bench pipeline.
 
 Every module (the pipeline script, the benchmark loaders, future extensions)
 logs through ``log`` so output stays uniform and no module re-implements it.
