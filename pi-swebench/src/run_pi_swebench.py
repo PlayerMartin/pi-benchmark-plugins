@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Optional
 
 from agents import AgentRunner, get_agent
+from cli_args import parse_args
 from benchmarks import (
     InstanceSpec,
     load_instances,
@@ -50,10 +51,8 @@ from repo_prep import (
 )
 
 DEFAULT_SPLIT = "test"
-DEFAULT_AGENT = "pi"
 DEFAULT_MODEL_NAME = "pi-agent"
 DEFAULT_RUN_DIR = "runs"
-DEFAULT_AGENT_TIMEOUT = 1800  # seconds per instance
 
 
 @dataclass
@@ -378,8 +377,10 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     n = sum(1 for _ in open(preds, encoding="utf-8"))
     log(f"Evaluating {n} prediction(s) from {preds}")
 
+    run_id = f"pi-{time.strftime('%Y%m%d-%H%M%S')}"
+    log(f"Run id: {run_id}")
     cmd = [
-        *args.eval_python.split(),
+        sys.executable,
         "-m",
         "swebench.harness.run_evaluation",
         "--dataset_name",
@@ -389,12 +390,11 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         "--predictions_path",
         str(preds),
         "--run_id",
-        args.run_id,
+        run_id,
         "--max_workers",
-        str(args.max_workers),
+        "1",
         "--report_dir",
-        args.report_dir,
-        *args.eval_extra_args,
+        "logs",
     ]
     log("Harness command: " + " ".join(cmd))
     proc = subprocess.run(cmd)
@@ -409,25 +409,20 @@ def cmd_report(args: argparse.Namespace) -> int:
       * per-instance   logs/run_evaluation/<run_id>/<model>/<instance>/report.json
     plus the legacy  logs/run_evaluation/<run_id>*/report.json.
     """
-    if args.report_json:
-        candidates = [Path(args.report_json)]
-    else:
-        report_dir = getattr(args, "report_dir", None) or "logs"
-        found: dict[Path, None] = {}
-        for pat in (
-            f"{report_dir}/*.{args.run_id}*.json",
-            f"logs/*.{args.run_id}*.json",
-            f"logs/run_evaluation/{args.run_id}*/**/report.json",
-            f"logs/run_evaluation/{args.run_id}*/report.json",
-        ):
-            for p in Path(".").glob(pat):
-                found[p.resolve()] = None
-        candidates = sorted(found, key=lambda p: p.stat().st_mtime, reverse=True)
+    found: dict[Path, None] = {}
+    for pat in (
+        f"logs/*.{args.run_id}*.json",
+        f"logs/run_evaluation/{args.run_id}*/**/report.json",
+        f"logs/run_evaluation/{args.run_id}*/report.json",
+    ):
+        for p in Path(".").glob(pat):
+            found[p.resolve()] = None
+    candidates = sorted(found, key=lambda p: p.stat().st_mtime, reverse=True)
 
     if not candidates:
         log(
             "No report found. Expected logs/<model>.<run_id>.json or "
-            "logs/run_evaluation/<run_id>/.../report.json; pass --report-json PATH."
+            "logs/run_evaluation/<run_id>/.../report.json."
         )
         return 1
 
@@ -501,75 +496,17 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def add_instance_selection(p: argparse.ArgumentParser) -> None:
-    p.add_argument(
-        "--dataset",
-        required=True,
-        help="benchmark:dataset identifier, e.g. swebench:SWE-bench/SWE-bench_Lite",
-    )
-    p.add_argument("--skip", type=int, default=0, help="skip the first N instances")
-    p.add_argument("--limit", "-l", type=int, default=0, help="take the next N (0 = all)")
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    args = parse_args(
+        None,
+        __doc__,
+        {
+            "list": cmd_list,
+            "run": cmd_run,
+            "evaluate": cmd_evaluate,
+            "report": cmd_report,
+        },
     )
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    p_list = sub.add_parser("list", help="list dataset instance ids")
-    add_instance_selection(p_list)
-    p_list.set_defaults(func=cmd_list)
-
-    p_run = sub.add_parser("run", help="run the full pipeline (steps 1-4)")
-    add_instance_selection(p_run)
-    p_run.add_argument(
-        "--agent",
-        default=DEFAULT_AGENT,
-        help="agent runner to use (default: pi)",
-    )
-    p_run.add_argument(
-        "--agent-model", required=True, help="model for the agent, e.g. sonnet:high"
-    )
-    p_run.add_argument(
-        "--agent-extra-args", default="", help="extra args passed verbatim to the agent"
-    )
-    p_run.add_argument(
-        "--agent-timeout", type=int, default=DEFAULT_AGENT_TIMEOUT, help="seconds per instance"
-    )
-    p_run.set_defaults(func=cmd_run)
-
-    p_eval = sub.add_parser("evaluate", help="run the SWE-bench harness (step 5)")
-    p_eval.add_argument("--predictions", required=True, help="predictions JSONL path")
-    p_eval.add_argument("--dataset", required=True, help="dataset the predictions are from")
-    p_eval.add_argument("--run-id", default=f"pi-{time.strftime('%Y%m%d-%H%M%S')}")
-    p_eval.add_argument(
-        "--eval-workers", "--max-workers", type=int, default=4, dest="max_workers"
-    )
-    p_eval.add_argument(
-        "--eval-python",
-        default=sys.executable,
-        help="python interpreter used to run the harness",
-    )
-    p_eval.add_argument("--eval-extra-args", default="", help="extra harness args")
-    p_eval.add_argument(
-        "--report-dir", default="logs", help="harness --report_dir (default logs)"
-    )
-    p_eval.set_defaults(func=cmd_evaluate)
-
-    p_rep = sub.add_parser("report", help="summarize a harness report")
-    p_rep.add_argument("--run-id", default="pi", help="run id prefix to search for")
-    p_rep.add_argument("--report-json", default=None, help="explicit path to report.json")
-    p_rep.add_argument(
-        "--report-dir", default="logs", help="harness report dir (default logs)"
-    )
-    p_rep.set_defaults(func=cmd_report)
-
-    args = parser.parse_args()
-    for attr in ("agent_extra_args", "eval_extra_args"):
-        value = getattr(args, attr, None)
-        if isinstance(value, str):
-            setattr(args, attr, value.split() if value.strip() else [])
     return args.func(args)
 
 
